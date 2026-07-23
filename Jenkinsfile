@@ -120,7 +120,7 @@ pipeline {
                                   -DskipTests=true \
                                   -Djacoco.skip=true \
                                   -Dsonar.projectKey="\$APP_NAME" \
-                                  -Dsonar.projectName="PFE App Test" \
+                                  -Dsonar.projectName="Devsecops Testbed" \
                                   -Dsonar.host.url="\$SONAR_HOST_URL" \
                                   -Dsonar.token="\$SONAR_TOKEN" \
                                   ${prArgs}
@@ -307,13 +307,13 @@ pipeline {
                         mkdir -p "$REPORT_BASE"
 
                         echo "=== Acces Kubernetes ==="
-                        if ! kubectl get svc -n "$K8S_NAMESPACE" >/dev/null 2>&1; then
+                        if ! timeout 15 kubectl get svc -n "$K8S_NAMESPACE" --request-timeout=10s >/dev/null 2>&1; then
                           echo '{"site":[],"status":"zap_k8s_unreachable"}' > "$REPORT_BASE/zap-report.json"
                           exit 0
                         fi
 
                         echo "=== Nettoyage ancien pod ==="
-                        kubectl delete pod "$ZAP_POD" -n "$K8S_NAMESPACE" --ignore-not-found=true || true
+                        timeout 20 kubectl delete pod "$ZAP_POD" -n "$K8S_NAMESPACE" --request-timeout=15s --ignore-not-found=true || true
 
                         echo "=== Lancement du pod ZAP (spider puis active scan) ==="
                         kubectl run "$ZAP_POD" \
@@ -401,28 +401,28 @@ PY
                             sleep 3600
                           '
 
-                        echo "=== Attente du rapport ZAP (jusqu a 36 min) ==="
-                        for i in $(seq 1 220); do
-                          if kubectl exec "$ZAP_POD" -n "$K8S_NAMESPACE" -- test -f /zap/wrk/zap.done 2>/dev/null; then
+                        echo "=== Attente du rapport ZAP (jusqu a 30 min) ==="
+                        for i in $(seq 1 180); do
+                          if timeout 15 kubectl exec "$ZAP_POD" -n "$K8S_NAMESPACE" --request-timeout=10s -- test -f /zap/wrk/zap.done 2>/dev/null; then
                             echo "ZAP termine"; break
                           fi
                           echo "Attente ZAP... $i"; sleep 10
                         done
 
                         echo "=== Logs ZAP ==="
-                        kubectl logs "$ZAP_POD" -n "$K8S_NAMESPACE" || true
+                        timeout 15 kubectl logs "$ZAP_POD" -n "$K8S_NAMESPACE" --request-timeout=10s || true
 
                         echo "=== Recuperation des rapports ==="
-                        kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap-report.json" "$REPORT_BASE/zap-report.json" || true
-                        kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap-report.html" "$REPORT_BASE/zap-report.html" || true
-                        kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap.log"        "$REPORT_BASE/zap.log"        || true
+                        timeout 20 kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap-report.json" "$REPORT_BASE/zap-report.json" || true
+                        timeout 20 kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap-report.html" "$REPORT_BASE/zap-report.html" || true
+                        timeout 20 kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap.log"        "$REPORT_BASE/zap.log"        || true
 
                         if [ ! -s "$REPORT_BASE/zap-report.json" ]; then
                           echo '{"site":[],"status":"zap_report_missing"}' > "$REPORT_BASE/zap-report.json"
                         fi
 
                         echo "=== Nettoyage pod ZAP ==="
-                        kubectl delete pod "$ZAP_POD" -n "$K8S_NAMESPACE" --ignore-not-found=true || true
+                        timeout 20 kubectl delete pod "$ZAP_POD" -n "$K8S_NAMESPACE" --request-timeout=15s --ignore-not-found=true || true
                         true
                     '''
                 }
@@ -453,6 +453,10 @@ PY
                     def branch = env.GIT_BRANCH?.replaceAll('origin/', '') ?: 'main'
                     def commit = env.GIT_COMMIT?.take(8) ?: 'unknown'
 
+                    // Nom du job SANS le suffixe de branche (Multibranch ajoute /main, /develop...)
+                    // pour matcher le jenkinsJobName tel que stocke cote plateforme.
+                    def jobShortName = env.JOB_NAME.split('/')[0]
+
                     def exists = { p -> sh(script: "test -s '${p}'", returnStatus: true) == 0 }
                     def trivyAvailable = exists("${env.REPORT_BASE}/trivy-report.json")
                     def zapAvailable   = exists("${env.REPORT_BASE}/zap-report.json")
@@ -460,7 +464,7 @@ PY
 
                     def payloadObject = [
                         event         : event,
-                        job           : env.JOB_NAME,
+                        job           : jobShortName,
                         build_number  : env.BUILD_NUMBER,
                         build_url     : env.BUILD_URL,
                         logs_url      : "${env.BUILD_URL}consoleText",
