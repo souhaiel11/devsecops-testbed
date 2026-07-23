@@ -4,7 +4,7 @@
 # ================================================================
 
 # IMAGE #1 : image de base ancienne = nombreuses CVE OS + JDK obsolete
-FROM openjdk:8-jdk
+FROM eclipse-temurin:8-jdk
 
 # MISCONFIG #1 : conteneur tournant en root (pas d'utilisateur dedie)
 WORKDIR /app
