@@ -29,8 +29,8 @@ pipeline {
         NVD_API_KEY = credentials('NVD_API_KEY')
         SONAR_TOKEN = credentials('SONAR_TOKEN')
 
-        APP_NAME   = 'pfe-app-test'
-        IMAGE_NAME = 'pfe-app-test'
+        APP_NAME   = 'devsecops-testbed'
+        IMAGE_NAME = 'devsecops-testbed'
 
         BACKEND_URL     = 'http://pfe-backend:3001'
         N8N_WEBHOOK_URL = 'http://n8n:5678/webhook/jenkins-event'
