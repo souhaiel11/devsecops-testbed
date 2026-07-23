@@ -59,6 +59,13 @@ pipeline {
                     set -e
                     mkdir -p "$REPORT_BASE"
 
+                    # Garde-fou : cree des rapports vides des le depart.
+                    # Si un scanner plante avant d'ecrire son fichier, n8n trouve
+                    # toujours quelque chose a lire au lieu d'un chemin absent.
+                    [ -f "$REPORT_BASE/trivy-report.json" ] || echo '{"SchemaVersion":2,"Results":[],"status":"not_run_yet"}' > "$REPORT_BASE/trivy-report.json"
+                    [ -f "$REPORT_BASE/dependency-check-report.json" ] || echo '{"dependencies":[],"status":"not_run_yet"}' > "$REPORT_BASE/dependency-check-report.json"
+                    [ -f "$REPORT_BASE/zap-report.json" ] || echo '{"site":[],"status":"not_run_yet"}' > "$REPORT_BASE/zap-report.json"
+
                     echo "============================================"
                     echo " Job              : $JOB_NAME"
                     echo " Build            : #$BUILD_NUMBER"
