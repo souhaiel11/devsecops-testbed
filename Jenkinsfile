@@ -29,8 +29,8 @@ pipeline {
         NVD_API_KEY = credentials('NVD_API_KEY')
         SONAR_TOKEN = credentials('SONAR_TOKEN')
 
-        APP_NAME   = 'devsecops-testbed'
-        IMAGE_NAME = 'devsecops-testbed'
+        APP_NAME   = 'pfe-app-test'
+        IMAGE_NAME = 'pfe-app-test'
 
         BACKEND_URL     = 'http://pfe-backend:3001'
         N8N_WEBHOOK_URL = 'http://n8n:5678/webhook/jenkins-event'
@@ -321,8 +321,6 @@ pipeline {
                           --image="$ZAP_IMAGE" \
                           --image-pull-policy=IfNotPresent \
                           --restart=Never \
-                          --requests='memory=768Mi,cpu=500m' \
-                          --limits='memory=1536Mi,cpu=1' \
                           --command -- sh -lc '
                             mkdir -p /zap/wrk && cd /zap/wrk
 
