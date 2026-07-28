@@ -404,7 +404,16 @@ except Exception as e:
 PY
 
                             ls -lh /zap/wrk || true
-                            touch /zap/wrk/zap.done
+                            sync
+                            # Ne signaler termine que si le rapport est reellement complet (>100 octets)
+                            if [ -s /zap/wrk/zap-report.json ] && [ $(wc -c < /zap/wrk/zap-report.json) -gt 100 ]; then
+                              sync
+                              sleep 2
+                              touch /zap/wrk/zap.done
+                            else
+                              echo "ZAP_REPORT_INCOMPLETE"
+                              touch /zap/wrk/zap.done
+                            fi
                             sleep 3600
                           '
 
