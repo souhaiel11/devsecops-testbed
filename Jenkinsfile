@@ -9,6 +9,8 @@ pipeline {
         disableConcurrentBuilds()
         timeout(time: 3, unit: 'HOURS')
         buildDiscarder(logRotator(numToKeepStr: '15'))
+        // JF-6 : horodatage de chaque ligne de log pour corrélation temporelle
+        timestamps()
     }
 
     parameters {
@@ -25,9 +27,9 @@ pipeline {
     }
 
     environment {
+        // JF-1 : SONAR_TOKEN retiré d'ici — injecté via withCredentials dans le stage dédié
         N8N_API_KEY = credentials('N8N_API_KEY')
         NVD_API_KEY = credentials('NVD_API_KEY')
-        SONAR_TOKEN = credentials('SONAR_TOKEN')
 
         APP_NAME   = 'devsecops-testbed'
         IMAGE_NAME = 'devsecops-testbed'
@@ -39,7 +41,10 @@ pipeline {
         K8S_NAMESPACE = 'pfe-devsecops'
         KUBECONFIG    = '/var/jenkins_home/.kube/config'
 
-        ZAP_IMAGE      = 'zaproxy/zap-stable:latest'
+        // JF-2 + JF-9 : image Trivy épinglée à un tag de version — vérifier la disponibilité avant merge
+        TRIVY_IMAGE    = 'aquasec/trivy:0.51.1'
+        // JF-3 : image ZAP épinglée à un tag de version — vérifier la disponibilité avant merge
+        ZAP_IMAGE      = 'zaproxy/zap-stable:2.15.0'
         ZAP_TARGET_URL = 'http://app-test:8080'
 
         IS_PR         = "${env.CHANGE_ID ? 'true' : 'false'}"
@@ -62,9 +67,9 @@ pipeline {
                     # Garde-fou : cree des rapports vides des le depart.
                     # Si un scanner plante avant d'ecrire son fichier, n8n trouve
                     # toujours quelque chose a lire au lieu d'un chemin absent.
-                    [ -f "$REPORT_BASE/trivy-report.json" ] || echo '{"SchemaVersion":2,"Results":[],"status":"not_run_yet"}' > "$REPORT_BASE/trivy-report.json"
-                    [ -f "$REPORT_BASE/dependency-check-report.json" ] || echo '{"dependencies":[],"status":"not_run_yet"}' > "$REPORT_BASE/dependency-check-report.json"
-                    [ -f "$REPORT_BASE/zap-report.json" ] || echo '{"site":[],"status":"not_run_yet"}' > "$REPORT_BASE/zap-report.json"
+                    [ -f "$REPORT_BASE/trivy-report.json" ]             || echo '{"SchemaVersion":2,"Results":[],"status":"not_run_yet"}' > "$REPORT_BASE/trivy-report.json"
+                    [ -f "$REPORT_BASE/dependency-check-report.json" ]  || echo '{"dependencies":[],"status":"not_run_yet"}' > "$REPORT_BASE/dependency-check-report.json"
+                    [ -f "$REPORT_BASE/zap-report.json" ]               || echo '{"site":[],"status":"not_run_yet"}' > "$REPORT_BASE/zap-report.json"
 
                     echo "============================================"
                     echo " Job              : $JOB_NAME"
@@ -110,29 +115,48 @@ pipeline {
             steps {
                 echo '=== STAGE 3: SonarQube SAST ==='
                 catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                    withSonarQubeEnv('sq1') {
-                        script {
-                            def prArgs = ''
-                            if (env.CHANGE_ID) {
-                                echo "SonarQube : mode Pull Request #${env.CHANGE_ID}"
-                                prArgs = " -Dsonar.pullrequest.key=${env.CHANGE_ID}" +
-                                         " -Dsonar.pullrequest.branch=${env.CHANGE_BRANCH}" +
-                                         " -Dsonar.pullrequest.base=${env.CHANGE_TARGET}"
-                            } else {
-                                echo "SonarQube : mode branche standard"
+                    // JF-1 : SONAR_TOKEN injecté uniquement ici via withCredentials,
+                    // jamais exposé en variable globale ni interpolé par Groovy
+                    withCredentials([string(credentialsId: 'SONAR_TOKEN', variable: 'SONAR_TOKEN_SECRET')]) {
+                        withSonarQubeEnv('sq1') {
+                            script {
+                                def prArgs = ''
+                                if (env.CHANGE_ID) {
+                                    echo "SonarQube : mode Pull Request #${env.CHANGE_ID}"
+                                    prArgs = " -Dsonar.pullrequest.key=${env.CHANGE_ID}" +
+                                             " -Dsonar.pullrequest.branch=${env.CHANGE_BRANCH}" +
+                                             " -Dsonar.pullrequest.base=${env.CHANGE_TARGET}"
+                                } else {
+                                    echo 'SonarQube : mode branche standard'
+                                }
+                                // Simples quotes sur le sh extérieur ; prArgs interpolé en Groovy
+                                // est acceptable car il ne contient que des métadonnées de branche
+                                sh """
+                                    set -e
+                                    mvn sonar:sonar -B \\
+                                      -DskipTests=true \\
+                                      -Djacoco.skip=true \\
+                                      -Dsonar.projectKey="\$APP_NAME" \\
+                                      -Dsonar.projectName="Devsecops Testbed" \\
+                                      -Dsonar.host.url="\$SONAR_HOST_URL" \\
+                                      -Dsonar.token="\$SONAR_TOKEN_SECRET" \\
+                                      ${prArgs}
+                                """
                             }
-                            sh """
-                                set -e
-                                mvn sonar:sonar -B \
-                                  -DskipTests=true \
-                                  -Djacoco.skip=true \
-                                  -Dsonar.projectKey="\$APP_NAME" \
-                                  -Dsonar.projectName="Devsecops Testbed" \
-                                  -Dsonar.host.url="\$SONAR_HOST_URL" \
-                                  -Dsonar.token="\$SONAR_TOKEN" \
-                                  ${prArgs}
-                            """
                         }
+                    }
+                }
+            }
+        }
+
+        // JF-7 : Quality Gate SonarQube bloquant (UNSTABLE sans arrêt du pipeline)
+        // Nécessite le plugin SonarQube Scanner et un webhook configuré côté SonarQube
+        stage('SonarQube Quality Gate') {
+            steps {
+                echo '=== STAGE 3b: SonarQube Quality Gate ==='
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                    timeout(time: 5, unit: 'MINUTES') {
+                        waitForQualityGate abortPipeline: false
                     }
                 }
             }
@@ -154,132 +178,139 @@ pipeline {
             }
         }
 
-        stage('Trivy Scan') {
-            options { timeout(time: 35, unit: 'MINUTES') }
-            steps {
-                echo '=== STAGE 5: Trivy (vulnerabilites + misconfig) ==='
-                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                    sh '''
-                        set -e
-                        BUILD="$BUILD_NUMBER"
-                        TMP_DIR="/tmp/trivy-test-$BUILD"
+        // JF-5 : Trivy et OWASP Dependency Check parallélisés — gain ~35 min
+        stage('Security Scans') {
+            parallel {
 
-                        rm -rf "$TMP_DIR"
-                        mkdir -p "$TMP_DIR" "$REPORT_BASE"
+                stage('Trivy Scan') {
+                    options { timeout(time: 35, unit: 'MINUTES') }
+                    steps {
+                        echo '=== STAGE 5a: Trivy (vulnerabilites + misconfig) ==='
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            sh '''
+                                set -e
+                                BUILD="$BUILD_NUMBER"
+                                TMP_DIR="/tmp/trivy-test-$BUILD"
 
-                        echo "=== Cache Trivy persistant ==="
-                        docker volume create trivy-cache >/dev/null || true
+                                rm -rf "$TMP_DIR"
+                                mkdir -p "$TMP_DIR" "$REPORT_BASE"
 
-                        echo "=== Export de l image ==="
-                        docker save "$IMAGE_NAME:$IMAGE_TAG" -o "$TMP_DIR/image.tar"
+                                echo "=== Cache Trivy persistant ==="
+                                docker volume create trivy-cache >/dev/null || true
 
-                        echo "=== Mise a jour de la base Trivy ==="
-                        docker run --rm -v trivy-cache:/root/.cache \
-                          aquasec/trivy:latest image --download-db-only || true
+                                echo "=== Export de l image ==="
+                                docker save "$IMAGE_NAME:$IMAGE_TAG" -o "$TMP_DIR/image.tar"
 
-                        echo "=== Conteneur Trivy ==="
-                        TRIVY_CID=$(docker create -v trivy-cache:/root/.cache \
-                          --entrypoint sh aquasec/trivy:latest -c "sleep 1800")
-                        docker start "$TRIVY_CID" >/dev/null
-                        docker cp "$TMP_DIR/image.tar" "$TRIVY_CID:/image.tar"
+                                echo "=== Mise a jour de la base Trivy ==="
+                                docker run --rm -v trivy-cache:/root/.cache \
+                                  "$TRIVY_IMAGE" image --download-db-only || true
 
-                        echo "=== Scan Trivy ==="
-                        docker exec "$TRIVY_CID" trivy image \
-                          --input /image.tar \
-                          --scanners vuln,misconfig \
-                          --skip-db-update \
-                          --skip-java-db-update \
-                          --exit-code 0 \
-                          --format json \
-                          --severity CRITICAL,HIGH,MEDIUM \
-                          --no-progress \
-                          --timeout 30m \
-                          --output /trivy-report.json || true
+                                echo "=== Conteneur Trivy ==="
+                                TRIVY_CID=$(docker create -v trivy-cache:/root/.cache \
+                                  --entrypoint sh "$TRIVY_IMAGE" -c "sleep 1800")
+                                docker start "$TRIVY_CID" >/dev/null
+                                docker cp "$TMP_DIR/image.tar" "$TRIVY_CID:/image.tar"
 
-                        docker cp "$TRIVY_CID:/trivy-report.json" "$TMP_DIR/trivy-report.json" || true
-                        docker rm -f "$TRIVY_CID" >/dev/null 2>&1 || true
+                                echo "=== Scan Trivy ==="
+                                docker exec "$TRIVY_CID" trivy image \
+                                  --input /image.tar \
+                                  --scanners vuln,misconfig \
+                                  --skip-db-update \
+                                  --skip-java-db-update \
+                                  --exit-code 0 \
+                                  --format json \
+                                  --severity CRITICAL,HIGH,MEDIUM \
+                                  --no-progress \
+                                  --timeout 30m \
+                                  --output /trivy-report.json || true
 
-                        if [ ! -s "$TMP_DIR/trivy-report.json" ]; then
-                          echo '{"SchemaVersion":2,"Results":[],"status":"trivy_report_missing"}' > "$TMP_DIR/trivy-report.json"
-                        fi
+                                docker cp "$TRIVY_CID:/trivy-report.json" "$TMP_DIR/trivy-report.json" || true
+                                docker rm -f "$TRIVY_CID" >/dev/null 2>&1 || true
 
-                        cp "$TMP_DIR/trivy-report.json" "$REPORT_BASE/trivy-report.json"
-                        rm -rf "$TMP_DIR"
+                                if [ ! -s "$TMP_DIR/trivy-report.json" ]; then
+                                  echo '{"SchemaVersion":2,"Results":[],"status":"trivy_report_missing"}' > "$TMP_DIR/trivy-report.json"
+                                fi
 
-                        echo "=== Rapport Trivy final ==="
-                        ls -lh "$REPORT_BASE/trivy-report.json" || true
-                    '''
+                                cp "$TMP_DIR/trivy-report.json" "$REPORT_BASE/trivy-report.json"
+                                rm -rf "$TMP_DIR"
+
+                                echo "=== Rapport Trivy final ==="
+                                ls -lh "$REPORT_BASE/trivy-report.json" || true
+                            '''
+                        }
+                    }
                 }
-            }
-        }
 
-        stage('OWASP Dependency Check') {
-            options { timeout(time: 40, unit: 'MINUTES') }
-            steps {
-                echo '=== STAGE 6: OWASP Dependency-Check (SCA) ==='
-                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                    sh '''
-                        set -e
-                        ODC_VERSION="12.2.2"
-                        ODC_DATA="/var/jenkins_home/dependency-check-data-v12"
+                stage('OWASP Dependency Check') {
+                    options { timeout(time: 40, unit: 'MINUTES') }
+                    steps {
+                        echo '=== STAGE 5b: OWASP Dependency-Check (SCA) ==='
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            sh '''
+                                set -e
+                                ODC_VERSION="12.2.2"
+                                ODC_DATA="/var/jenkins_home/dependency-check-data-v12"
 
-                        mkdir -p "$REPORT_BASE" "$ODC_DATA"
+                                mkdir -p "$REPORT_BASE" "$ODC_DATA"
 
-                        if [ "$JENKINS_HARD_GATE" = "true" ]; then
-                          FAIL_CVSS="$CVSS_FAIL_THRESHOLD"
-                        else
-                          FAIL_CVSS="11"
-                        fi
-                        echo "OWASP failBuildOnCVSS = $FAIL_CVSS"
+                                if [ "$JENKINS_HARD_GATE" = "true" ]; then
+                                  FAIL_CVSS="$CVSS_FAIL_THRESHOLD"
+                                else
+                                  FAIL_CVSS="11"
+                                fi
+                                echo "OWASP failBuildOnCVSS = $FAIL_CVSS"
 
-                        {
-                          echo "=== Etape 1 : mise a jour NVD (avec cle API) ==="
-                          timeout 20m mvn org.owasp:dependency-check-maven:$ODC_VERSION:update-only \
-                            -DdataDirectory="$ODC_DATA" \
-                            -DnvdApiKey="$NVD_API_KEY" \
-                            -DnvdApiDelay=2000 \
-                            -DnvdMaxRetryCount=15 \
-                            -DnvdValidForHours=168 \
-                            -DretireJsAnalyzerEnabled=false \
-                            -DnodeAuditAnalyzerEnabled=false \
-                            -DossindexAnalyzerEnabled=false \
-                            -B || true
+                                {
+                                  echo "=== Etape 1 : mise a jour NVD (avec cle API) ==="
+                                  timeout 20m mvn org.owasp:dependency-check-maven:$ODC_VERSION:update-only \
+                                    -DdataDirectory="$ODC_DATA" \
+                                    -DnvdApiKey="$NVD_API_KEY" \
+                                    -DnvdApiDelay=2000 \
+                                    -DnvdMaxRetryCount=15 \
+                                    -DnvdValidForHours=168 \
+                                    -DretireJsAnalyzerEnabled=false \
+                                    -DnodeAuditAnalyzerEnabled=false \
+                                    -DossindexAnalyzerEnabled=false \
+                                    -B || true
 
-                          echo "=== Etape 2 : scan des dependances (cache local) ==="
-                          timeout 20m mvn org.owasp:dependency-check-maven:$ODC_VERSION:check \
-                            -Dformat=ALL \
-                            -DfailBuildOnCVSS="$FAIL_CVSS" \
-                            -DfailOnError=false \
-                            -DdataDirectory="$ODC_DATA" \
-                            -DautoUpdate=false \
-                            -DretireJsAnalyzerEnabled=false \
-                            -DnodeAuditAnalyzerEnabled=false \
-                            -DossindexAnalyzerEnabled=false \
-                            -B || true
-                        } > "$REPORT_BASE/owasp.log" 2>&1
+                                  echo "=== Etape 2 : scan des dependances (cache local) ==="
+                                  timeout 20m mvn org.owasp:dependency-check-maven:$ODC_VERSION:check \
+                                    -Dformat=ALL \
+                                    -DfailBuildOnCVSS="$FAIL_CVSS" \
+                                    -DfailOnError=false \
+                                    -DdataDirectory="$ODC_DATA" \
+                                    -DautoUpdate=false \
+                                    -DretireJsAnalyzerEnabled=false \
+                                    -DnodeAuditAnalyzerEnabled=false \
+                                    -DossindexAnalyzerEnabled=false \
+                                    -B || true
+                                } > "$REPORT_BASE/owasp.log" 2>&1
 
-                        echo "=== Fin de log OWASP ==="
-                        tail -80 "$REPORT_BASE/owasp.log" || true
+                                echo "=== Fin de log OWASP ==="
+                                tail -80 "$REPORT_BASE/owasp.log" || true
 
-                        if [ -f target/dependency-check-report.json ]; then
-                          cp target/dependency-check-report.json "$REPORT_BASE/dependency-check-report.json"
-                        else
-                          echo '{"dependencies":[],"status":"owasp_report_missing"}' > "$REPORT_BASE/dependency-check-report.json"
-                        fi
-                        [ -f target/dependency-check-report.html ] && cp target/dependency-check-report.html "$REPORT_BASE/" || true
-                        [ -f target/dependency-check-report.xml ]  && cp target/dependency-check-report.xml  "$REPORT_BASE/" || true
+                                if [ -f target/dependency-check-report.json ]; then
+                                  cp target/dependency-check-report.json "$REPORT_BASE/dependency-check-report.json"
+                                else
+                                  echo '{"dependencies":[],"status":"owasp_report_missing"}' > "$REPORT_BASE/dependency-check-report.json"
+                                fi
+                                [ -f target/dependency-check-report.html ] && cp target/dependency-check-report.html "$REPORT_BASE/" || true
+                                [ -f target/dependency-check-report.xml ]  && cp target/dependency-check-report.xml  "$REPORT_BASE/" || true
 
-                        echo "=== Rapports OWASP finaux ==="
-                        ls -lh "$REPORT_BASE"/dependency-check-report.* || true
-                    '''
+                                echo "=== Rapports OWASP finaux ==="
+                                ls -lh "$REPORT_BASE"/dependency-check-report.* || true
+                            '''
+                        }
+                    }
                 }
+
             }
         }
 
         stage('Kubernetes Target Check') {
             when { expression { env.CHANGE_ID == null } }
             steps {
-                echo '=== STAGE 7: Verification cible Kubernetes ==='
+                echo '=== STAGE 6: Verification cible Kubernetes ==='
                 catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                     sh '''
                         set +e
@@ -304,7 +335,7 @@ pipeline {
             when { expression { env.CHANGE_ID == null } }
             options { timeout(time: 40, unit: 'MINUTES') }
             steps {
-                echo '=== STAGE 8: OWASP ZAP DAST (spider + active scan) ==='
+                echo '=== STAGE 7: OWASP ZAP DAST (spider + active scan) ==='
                 catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                     sh '''
                         set +e
@@ -315,7 +346,7 @@ pipeline {
 
                         echo "=== Acces Kubernetes ==="
                         if ! timeout 15 kubectl get svc -n "$K8S_NAMESPACE" --request-timeout=10s >/dev/null 2>&1; then
-                          echo '{"site":[],"status":"zap_k8s_unreachable"}' > "$REPORT_BASE/zap-report.json"
+                          echo \'{"site":[],"status":"zap_k8s_unreachable"}\' > "$REPORT_BASE/zap-report.json"
                           exit 0
                         fi
 
@@ -328,7 +359,7 @@ pipeline {
                           --image="$ZAP_IMAGE" \
                           --image-pull-policy=IfNotPresent \
                           --restart=Never \
-                          --command -- sh -lc '
+                          --command -- sh -lc \'
                             mkdir -p /zap/wrk && cd /zap/wrk
 
                             /zap/zap.sh -daemon -host 0.0.0.0 -port 8090 \
@@ -371,9 +402,9 @@ except Exception as e:
     print("TARGET_ACCESS_ERROR", e)
 
 try:
-    sid = json.loads(call("/JSON/spider/action/scan/", {"url": target, "recurse": "true"}))["scan"]
+    sid = json.loads(call("/JSON/spider/action/scan/", {"url": target, "recurse": "true"}))[ "scan"]
     while True:
-        st = json.loads(call("/JSON/spider/view/status/", {"scanId": sid}))["status"]
+        st = json.loads(call("/JSON/spider/view/status/", {"scanId": sid}))[ "status"]
         if int(st) >= 100: break
         time.sleep(3)
     print("SPIDER_DONE")
@@ -381,9 +412,9 @@ except Exception as e:
     print("SPIDER_ERROR", e)
 
 try:
-    aid = json.loads(call("/JSON/ascan/action/scan/", {"url": target, "recurse": "true"}))["scan"]
+    aid = json.loads(call("/JSON/ascan/action/scan/", {"url": target, "recurse": "true"}))[ "scan"]
     while True:
-        st = json.loads(call("/JSON/ascan/view/status/", {"scanId": aid}))["status"]
+        st = json.loads(call("/JSON/ascan/view/status/", {"scanId": aid}))[ "status"]
         if int(st) >= 100: break
         time.sleep(5)
     print("ACTIVE_SCAN_DONE")
@@ -415,7 +446,7 @@ PY
                               touch /zap/wrk/zap.done
                             fi
                             sleep 3600
-                          '
+                          \'
 
                         echo "=== Attente du rapport ZAP (jusqu a 30 min) ==="
                         for i in $(seq 1 180); do
@@ -434,7 +465,7 @@ PY
                         timeout 20 kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap.log"        "$REPORT_BASE/zap.log"        || true
 
                         if [ ! -s "$REPORT_BASE/zap-report.json" ]; then
-                          echo '{"site":[],"status":"zap_report_missing"}' > "$REPORT_BASE/zap-report.json"
+                          echo \'{"site":[],"status":"zap_report_missing"}\' > "$REPORT_BASE/zap-report.json"
                         fi
 
                         echo "=== Nettoyage pod ZAP ==="
@@ -519,7 +550,9 @@ PY
 
                     sh 'mkdir -p "$REPORT_BASE" && cp jenkins-webhook-payload.json "$REPORT_BASE/payload.json" || true'
 
+                    // JF-8 : backoff exponentiel entre les tentatives (5s, 15s, 45s)
                     def notified = false
+                    def backoffSeconds = [5, 15, 45]
                     for (int attempt = 1; attempt <= 3 && !notified; attempt++) {
                         echo "Notification n8n : tentative ${attempt}/3"
                         def code = sh(
@@ -541,7 +574,9 @@ PY
                             echo 'n8n notifie avec succes'
                         } else {
                             echo "Echec tentative ${attempt}"
-                            sleep(time: 5, unit: 'SECONDS')
+                            if (attempt < 3) {
+                                sleep(time: backoffSeconds[attempt - 1], unit: 'SECONDS')
+                            }
                         }
                     }
                     if (!notified) {
@@ -556,7 +591,8 @@ PY
                 }
             }
 
-            deleteDir()
+            // JF-4 : cleanWs() remplace deleteDir() pour un nettoyage complet du workspace
+            cleanWs()
         }
 
         success  { echo 'Pipeline SUCCESS' }
